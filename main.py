@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+Calendly Weekend Availability Crawler
+Polls https://calendly.com/96th-st-rcta every 10 minutes.
+Emails hanhphuc296@gmail.com only when NEW Fri/Sat/Sun slots appear.
+"""
+
+import requests
+import smtplib
+import time
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+
+CALENDLY_USERNAME = "96th-st-rcta"
+
+EMAIL_TO   = "hanhphuc296@gmail.com"
+EMAIL_FROM = "hanhphuc296@gmail.com"
+
+SMTP_HOST     = "smtp.gmail.com"
+SMTP_PORT     = 587
+SMTP_USER     = "hanhphuc296@gmail.com"
+SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]   # set this in Railway dashboard
+
+CHECK_INTERVAL  = 600   # seconds (10 minutes)
+WEEKS_AHEAD     = 6
+TARGET_WEEKDAYS = {4: "Friday", 5: "Saturday", 6: "Sunday"}
+
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M",
+)
+log = logging.getLogger(__name__)
+
+# ─── CALENDLY HELPERS ─────────────────────────────────────────────────────────
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def get_event_types() -> list[dict]:
+    url = f"https://calendly.com/api/booking/profiles/{CALENDLY_USERNAME}/event_types"
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
+def get_available_days(slug: str, start: datetime, end: datetime) -> list[str]:
+    url = (
+        f"https://calendly.com/api/booking/event_types/"
+        f"{CALENDLY_USERNAME}/{slug}/calendar/range"
+    )
+    params = {
+        "timezone":    "America/New_York",
+        "diagnostics": "false",
+        "range_start": start.strftime("%Y-%m-%d"),
+        "range_end":   end.strftime("%Y-%m-%d"),
+    }
+    r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+    r.raise_for_status()
+    days = r.json().get("days", [])
+    return [d["date"] for d in days if d.get("status") == "available"]
+
+
+def get_available_times(slug: str, date: str) -> list[str]:
+    url = (
+        f"https://calendly.com/api/booking/event_types/"
+        f"{CALENDLY_USERNAME}/{slug}/calendar/spots"
+    )
+    r = requests.get(url, headers=HEADERS, params={"timezone": "America/New_York", "date": date}, timeout=15)
+    r.raise_for_status()
+    spots = r.json().get("spots", [])
+    times = []
+    for spot in spots:
+        if spot.get("status") == "available":
+            raw = spot.get("start_time", "")
+            if raw:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                et = dt.astimezone(timezone(timedelta(hours=-4)))
+                times.append(et.strftime("%-I:%M %p"))
+    return times
+
+
+def scan() -> dict[str, list[str]]:
+    event_types = get_event_types()
+    today = datetime.now().date()
+    start = datetime.combine(today, datetime.min.time())
+    end   = start + timedelta(weeks=WEEKS_AHEAD)
+
+    found: dict[str, list[str]] = {}
+    for et in event_types:
+        slug = et.get("slug")
+        if not slug:
+            continue
+        for date_str in get_available_days(slug, start, end):
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            if dt.weekday() in TARGET_WEEKDAYS and date_str not in found:
+                try:
+                    times = get_available_times(slug, date_str)
+                except Exception:
+                    times = []
+                found[date_str] = times
+    return found
+
+
+# ─── EMAIL ────────────────────────────────────────────────────────────────────
+
+def send_email(new_slots: dict[str, list[str]]):
+    lines = ["New weekend private lesson slots just opened at 96th St / RCTA!\n"]
+    for date_str in sorted(new_slots):
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        label = dt.strftime("%A, %B %-d")
+        times = new_slots[date_str]
+        time_str = ", ".join(times) if times else "(tap Calendly for exact times)"
+        lines.append(f"  📅 {label}: {time_str}")
+    lines += [
+        "",
+        f"Book now → https://calendly.com/{CALENDLY_USERNAME}",
+        "",
+        "(You'll only be notified when new slots appear.)",
+    ]
+    body = "\n".join(lines)
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "🎾 New Weekend Lesson Slot — 96th St/RCTA"
+    msg["From"]    = EMAIL_FROM
+    msg["To"]      = EMAIL_TO
+    msg.attach(MIMEText(body, "plain"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+
+    log.info("📧 Email sent for %d new slot(s): %s", len(new_slots), list(new_slots.keys()))
+
+
+# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+
+def main():
+    log.info("Crawler started — checking every %d min for Fri/Sat/Sun openings.", CHECK_INTERVAL // 60)
+    alerted: set[str] = set()
+
+    while True:
+        try:
+            log.info("Scanning Calendly…")
+            current = scan()
+
+            if current:
+                log.info("Available weekend days: %s", list(current.keys()))
+            else:
+                log.info("No Fri/Sat/Sun openings right now.")
+
+            new_slots = {d: t for d, t in current.items() if d not in alerted}
+            if new_slots:
+                log.info("🆕 New slots: %s — sending email.", list(new_slots.keys()))
+                try:
+                    send_email(new_slots)
+                    alerted.update(new_slots.keys())
+                except Exception as e:
+                    log.error("Email failed: %s", e)
+            else:
+                log.info("No new slots since last alert.")
+
+            # Remove past dates from alerted set
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            alerted = {d for d in alerted if d >= today_str}
+
+        except Exception as e:
+            log.error("Scan error: %s", e)
+
+        log.info("Sleeping %d min…\n", CHECK_INTERVAL // 60)
+        time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
