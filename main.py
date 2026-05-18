@@ -18,15 +18,14 @@ from email.mime.multipart import MIMEMultipart
 
 CALENDLY_USERNAME = "96th-st-rcta"
 
-EMAIL_TO   = "hanhphuc296@gmail.com"
-EMAIL_FROM = "hanhphuc296@gmail.com"
-
+EMAIL_TO      = "hanhphuc296@gmail.com"
+EMAIL_FROM    = "hanhphuc296@gmail.com"
 SMTP_HOST     = "smtp.gmail.com"
 SMTP_PORT     = 587
 SMTP_USER     = "hanhphuc296@gmail.com"
-SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]   # set this in Railway dashboard
+SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]  # set in Railway dashboard
 
-CHECK_INTERVAL  = 600   # seconds (10 minutes)
+CHECK_INTERVAL  = 600  # 10 minutes
 WEEKS_AHEAD     = 6
 TARGET_WEEKDAYS = {4: "Friday", 5: "Saturday", 6: "Sunday"}
 
@@ -48,14 +47,25 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "X-Requested-With": "XMLHttpRequest",
+    "Accept": "application/json",
 }
 
 
 def get_event_types() -> list[dict]:
+    """Fetch all event types — handles both list and {data:[]} response shapes."""
     url = f"https://calendly.com/api/booking/profiles/{CALENDLY_USERNAME}/event_types"
     r = requests.get(url, headers=HEADERS, timeout=15)
     r.raise_for_status()
-    return r.json().get("data", [])
+    log.info("event_types raw response: %s", r.text[:300])
+    data = r.json()
+    # API may return a plain list OR {"data": [...]} OR {"collection": [...]}
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("data", "collection", "event_types", "results"):
+            if key in data and isinstance(data[key], list):
+                return data[key]
+    raise ValueError(f"Unexpected event_types response shape: {type(data)} — {str(data)[:200]}")
 
 
 def get_available_days(slug: str, start: datetime, end: datetime) -> list[str]:
@@ -71,8 +81,15 @@ def get_available_days(slug: str, start: datetime, end: datetime) -> list[str]:
     }
     r = requests.get(url, headers=HEADERS, params=params, timeout=15)
     r.raise_for_status()
-    days = r.json().get("days", [])
-    return [d["date"] for d in days if d.get("status") == "available"]
+    body = r.json()
+    # Handle both {"days": [...]} and a plain list
+    if isinstance(body, list):
+        days = body
+    elif isinstance(body, dict):
+        days = body.get("days", [])
+    else:
+        days = []
+    return [d["date"] for d in days if isinstance(d, dict) and d.get("status") == "available"]
 
 
 def get_available_times(slug: str, date: str) -> list[str]:
@@ -80,11 +97,24 @@ def get_available_times(slug: str, date: str) -> list[str]:
         f"https://calendly.com/api/booking/event_types/"
         f"{CALENDLY_USERNAME}/{slug}/calendar/spots"
     )
-    r = requests.get(url, headers=HEADERS, params={"timezone": "America/New_York", "date": date}, timeout=15)
+    r = requests.get(
+        url, headers=HEADERS,
+        params={"timezone": "America/New_York", "date": date},
+        timeout=15,
+    )
     r.raise_for_status()
-    spots = r.json().get("spots", [])
+    body = r.json()
+    if isinstance(body, list):
+        spots = body
+    elif isinstance(body, dict):
+        spots = body.get("spots", [])
+    else:
+        spots = []
+
     times = []
     for spot in spots:
+        if not isinstance(spot, dict):
+            continue
         if spot.get("status") == "available":
             raw = spot.get("start_time", "")
             if raw:
@@ -96,16 +126,29 @@ def get_available_times(slug: str, date: str) -> list[str]:
 
 def scan() -> dict[str, list[str]]:
     event_types = get_event_types()
+    log.info("Found %d event type(s)", len(event_types))
+
     today = datetime.now().date()
     start = datetime.combine(today, datetime.min.time())
     end   = start + timedelta(weeks=WEEKS_AHEAD)
 
     found: dict[str, list[str]] = {}
     for et in event_types:
-        slug = et.get("slug")
-        if not slug:
+        if not isinstance(et, dict):
             continue
-        for date_str in get_available_days(slug, start, end):
+        # slug may be stored under different keys depending on API version
+        slug = et.get("slug") or et.get("url") or et.get("scheduling_url", "").rstrip("/").split("/")[-1]
+        name = et.get("name", slug)
+        if not slug:
+            log.warning("Skipping event type with no slug: %s", et)
+            continue
+        log.info("Checking event type: %s (%s)", name, slug)
+        try:
+            available = get_available_days(slug, start, end)
+        except Exception as e:
+            log.error("Error fetching days for %s: %s", slug, e)
+            continue
+        for date_str in available:
             dt = datetime.strptime(date_str, "%Y-%m-%d")
             if dt.weekday() in TARGET_WEEKDAYS and date_str not in found:
                 try:
@@ -124,7 +167,7 @@ def send_email(new_slots: dict[str, list[str]]):
         dt = datetime.strptime(date_str, "%Y-%m-%d")
         label = dt.strftime("%A, %B %-d")
         times = new_slots[date_str]
-        time_str = ", ".join(times) if times else "(tap Calendly for exact times)"
+        time_str = ", ".join(times) if times else "(see Calendly for exact times)"
         lines.append(f"  📅 {label}: {time_str}")
     lines += [
         "",
@@ -145,7 +188,7 @@ def send_email(new_slots: dict[str, list[str]]):
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
 
-    log.info("📧 Email sent for %d new slot(s): %s", len(new_slots), list(new_slots.keys()))
+    log.info("📧 Email sent for slots: %s", list(new_slots.keys()))
 
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
@@ -166,7 +209,7 @@ def main():
 
             new_slots = {d: t for d, t in current.items() if d not in alerted}
             if new_slots:
-                log.info("🆕 New slots: %s — sending email.", list(new_slots.keys()))
+                log.info("🆕 New slots detected: %s", list(new_slots.keys()))
                 try:
                     send_email(new_slots)
                     alerted.update(new_slots.keys())
@@ -175,7 +218,7 @@ def main():
             else:
                 log.info("No new slots since last alert.")
 
-            # Remove past dates from alerted set
+            # Prune past dates so we re-alert if they reopen
             today_str = datetime.now().strftime("%Y-%m-%d")
             alerted = {d for d in alerted if d >= today_str}
 
